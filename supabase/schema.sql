@@ -1,0 +1,31 @@
+-- My Movie Club：請在 Supabase > SQL Editor 執行整份 SQL
+create extension if not exists pgcrypto;
+create table if not exists public.profiles(id uuid primary key references auth.users(id) on delete cascade,display_name text not null default 'Movie Lover');
+create table if not exists public.lists(id uuid primary key default gen_random_uuid(),name text not null,list_type text not null check(list_type in('personal','shared')),owner_id uuid not null references auth.users(id) on delete cascade,created_at timestamptz default now());
+create table if not exists public.list_members(list_id uuid references public.lists(id) on delete cascade,user_id uuid references auth.users(id) on delete cascade,role text not null default 'member' check(role in('owner','member')),joined_at timestamptz default now(),primary key(list_id,user_id));
+create table if not exists public.list_invites(id uuid primary key default gen_random_uuid(),list_id uuid references public.lists(id) on delete cascade,invite_code text unique not null,created_by uuid references auth.users(id) on delete cascade,expires_at timestamptz not null default now()+interval '7 days');
+create table if not exists public.list_items(id uuid primary key default gen_random_uuid(),list_id uuid not null references public.lists(id) on delete cascade,tmdb_id bigint not null,media_type text not null check(media_type in('movie','tv')),title text not null,overview text,poster_path text,release_date text,status text not null default 'want' check(status in('want','watching','watched','dropped')),is_favorite boolean default false,personal_rating int check(personal_rating between 1 and 5),review text,season_number int,episode_number int,created_by uuid references auth.users(id),created_at timestamptz default now(),unique(list_id,tmdb_id,media_type));
+create or replace function public.is_member(lid uuid) returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from list_members where list_id=lid and user_id=auth.uid())$$;
+create or replace function public.create_movie_list(p_name text,p_list_type text) returns uuid language plpgsql security definer set search_path=public as $$declare x uuid;begin if auth.uid() is null then raise exception '請先登入';end if;insert into lists(name,list_type,owner_id) values(trim(p_name),p_list_type,auth.uid()) returning id into x;insert into list_members(list_id,user_id,role) values(x,auth.uid(),'owner');return x;end$$;
+create or replace function public.create_list_invite(p_list_id uuid) returns text language plpgsql security definer set search_path=public as $$declare c text;begin if not exists(select 1 from lists where id=p_list_id and owner_id=auth.uid()) then raise exception '只有清單建立者可以產生邀請碼';end if;c:=upper(substr(encode(gen_random_bytes(8),'hex'),1,8));insert into list_invites(list_id,invite_code,created_by) values(p_list_id,c,auth.uid());return c;end$$;
+create or replace function public.join_movie_list(p_invite_code text) returns uuid language plpgsql security definer set search_path=public as $$declare x uuid;begin select list_id into x from list_invites where invite_code=upper(trim(p_invite_code)) and expires_at>now() limit 1;if x is null then raise exception '邀請碼無效或已過期';end if;insert into list_members(list_id,user_id) values(x,auth.uid()) on conflict do nothing;return x;end$$;
+alter table profiles enable row level security;alter table lists enable row level security;alter table list_members enable row level security;alter table list_invites enable row level security;alter table list_items enable row level security;
+create policy "profile read authenticated" on profiles for select to authenticated using(true);
+create policy "profile insert self" on profiles for insert to authenticated with check(id=auth.uid());
+create policy "profile update self" on profiles for update to authenticated using(id=auth.uid()) with check(id=auth.uid());
+create policy "members read lists" on lists for select to authenticated using(is_member(id));
+create policy "owner create lists" on lists for insert to authenticated with check(owner_id=auth.uid());
+create policy "owner update lists" on lists for update to authenticated using(owner_id=auth.uid());
+create policy "owner delete lists" on lists for delete to authenticated using(owner_id=auth.uid());
+create policy "members read membership" on list_members for select to authenticated using(is_member(list_id));
+create policy "self join membership" on list_members for insert to authenticated with check(user_id=auth.uid());
+create policy "owner remove members" on list_members for delete to authenticated using(exists(select 1 from lists where id=list_id and owner_id=auth.uid()) or user_id=auth.uid());
+create policy "owner manage invites" on list_invites for all to authenticated using(exists(select 1 from lists where id=list_id and owner_id=auth.uid())) with check(exists(select 1 from lists where id=list_id and owner_id=auth.uid()));
+create policy "members read items" on list_items for select to authenticated using(is_member(list_id));
+create policy "members add items" on list_items for insert to authenticated with check(is_member(list_id) and created_by=auth.uid());
+create policy "members update items" on list_items for update to authenticated using(is_member(list_id)) with check(is_member(list_id));
+create policy "members delete items" on list_items for delete to authenticated using(is_member(list_id));
+-- 新使用者註冊後自動建立個人清單
+create or replace function public.new_user_setup() returns trigger language plpgsql security definer set search_path=public as $$declare l uuid;begin insert into profiles(id,display_name) values(new.id,coalesce(new.raw_user_meta_data->>'display_name','Movie Lover'));insert into lists(name,list_type,owner_id) values('我的片單','personal',new.id) returning id into l;insert into list_members(list_id,user_id,role) values(l,new.id,'owner');return new;end$$;
+drop trigger if exists on_auth_user_created_movie_club on auth.users;
+create trigger on_auth_user_created_movie_club after insert on auth.users for each row execute procedure public.new_user_setup();
